@@ -9,6 +9,8 @@ class Pottery extends Model
     protected $fillable = [
         'image_path',
         'predicted_label',
-        'confidence'
+        'confidence',
+        'ai_model',
+        'raw_answer',
     ];
 }
