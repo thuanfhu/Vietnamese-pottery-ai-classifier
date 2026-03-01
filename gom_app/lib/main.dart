@@ -48,7 +48,6 @@ class _HomeScreenState extends State<HomeScreen> {
   static const _navyLight = Color(0xFFE8EFF6);
   static const _bg = Color(0xFFF4F7FB);
   static const _brown = _navy;
-  static const _brownLight = _navyLight;
 
   List<dynamic> potteryList = [];
   bool isLoading = true;
