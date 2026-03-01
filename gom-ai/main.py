@@ -1,4 +1,4 @@
-import base64
+import asyncio
 import json
 import logging
 import os
@@ -7,10 +7,9 @@ import sys
 
 import openai
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from pathlib import Path
 
-# google-genai (Gemini)
 try:
     from google import genai as google_genai
     from google.genai import types as genai_types
@@ -18,92 +17,165 @@ try:
 except ImportError:
     _GENAI_AVAILABLE = False
 
-# Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[logging.StreamHandler(sys.stdout)],
 )
-logger = logging.getLogger("gom-ai")
+logger = logging.getLogger("gom-ai-tadp")
 
-# Environment
 load_dotenv(dotenv_path=Path(__file__).resolve().parent / ".env", override=True)
 
-GROQ_API_KEY   = os.getenv("GROQ_API_KEY")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+XAI_API_KEY    = os.getenv("XAI_API_KEY", "")
 
 logger.info(
-    "API keys -- GROQ:%s  GOOGLE:%s  genai_sdk:%s",
-    "OK" if GROQ_API_KEY   else "MISSING",
+    "API keys  GOOGLE:%s  OPENAI:%s  XAI:%s  genai_sdk:%s",
     "OK" if GOOGLE_API_KEY else "MISSING",
+    "OK" if OPENAI_API_KEY else "MISSING",
+    "OK" if XAI_API_KEY    else "MISSING",
     "OK" if _GENAI_AVAILABLE else "NOT INSTALLED",
 )
 
-# App
-app = FastAPI()
+app = FastAPI(title="Gom AI TADP")
 
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
+# Recognized pottery origin labels accepted by the classifier
 VALID_LABELS = [
     "Bat Trang", "Bau Truc", "Bien Hoa", "Chu Dau",
     "Dong Trieu", "Lai Thieu", "Phu Lang", "Thanh Ha", "Tho Ha",
 ]
 
-# -- Model registry -----------------------------------------------------------
-# provider: "google" | "groq"
-# model_id: actual model name for the provider's API
-MODELS: dict[str, dict] = {
-    # Google Gemini 2.5 Flash — best free vision, 1M context (default)
-    "gemini":      {"provider": "google", "model_id": "gemini-2.5-flash"},
-    # Google Gemini 3 Flash Preview — newest, frontier intelligence, free tier
-    "gemini3":     {"provider": "google", "model_id": "gemini-3-flash-preview"},
-    # Google Gemini 2.5 Flash-Lite — fastest + most cost-efficient, free tier
-    "gemini_lite": {"provider": "google", "model_id": "gemini-2.5-flash-lite"},
-    # Meta Llama 4 Scout via Groq — only vision model on Groq, 20MB image limit
-    "llama4":      {"provider": "groq",   "model_id": "meta-llama/llama-4-scout-17b-16e-instruct"},
-}
+# Per-agent timeout (seconds) and total hard cap for the full pipeline
+AGENT_TIMEOUT_SEC = 50
+TOTAL_TIMEOUT_SEC = 210
 
-DEFAULT_MODEL = "gemini"
+GEMINI_MODEL = "gemini-2.5-flash"
+OPENAI_MODEL = "gpt-4o-mini"
+GROK_MODEL   = "grok-4-latest"
+OPENAI_BASE  = "https://api.openai.com/v1"
+XAI_BASE     = "https://api.x.ai/v1"
 
-# Prompts (UTF-8 Vietnamese with full diacritics)
-PROMPT_VISION = (
-    "Bạn là chuyên gia gốm sứ truyền thống Việt Nam.\n\n"
-    "Hãy phân tích ảnh gốm được tải lên.\n\n"
-    "— Nếu ảnh KHÔNG phải đồ gốm hoặc gốm sứ: chỉ trả về đúng một dòng JSON sau, "
-    "không thêm bất cứ nội dung nào khác:\n"
-    '{"predicted_label": "not_pottery", "confidence": 0.0}\n\n'
-    "— Nếu là gốm sứ, hãy làm theo đúng thứ tự:\n"
-    "1. Viết 2–3 câu mô tả đặc điểm nổi bật: màu sắc men, họa tiết trang trí, "
-    "kỹ thuật nung, phong cách nghệ thuật. "
-    "TUYỆT ĐỐI không dùng dấu **, không viết tiêu đề ##, không dùng - gạch đầu dòng, "
-    "không dùng markdown. Viết thành văn xuôi liền mạch.\n"
-    "2. Xác định đúng một làng gốm trong danh sách sau: "
-    "Bat Trang, Bau Truc, Bien Hoa, Chu Dau, Dong Trieu, Lai Thieu, Phu Lang, Thanh Ha, Tho Ha.\n"
-    "3. Cuối cùng, viết đúng một dòng JSON (không markdown, không giải thích thêm):\n"
-    '{"predicted_label": "<tên làng>", "confidence": <số từ 0.0 đến 1.0>}\n\n'
-    "Trả lời bằng tiếng Việt có đầy đủ dấu."
-)
+PROMPT_AGENT1_OBSERVER = """\
+Bạn là chuyên gia phân tích vật lý gốm sứ cổ Việt Nam với 30 năm kinh nghiệm.
 
-# Markdown stripper
+Nhiệm vụ: Quan sát và mô tả THUẦN TÚY vật lý ảnh được tải lên.
+
+QUY TẮC BẮT BUỘC:
+- TUYỆT ĐỐI KHÔNG đoán tên làng gốm, vùng sản xuất, hoặc niên đại.
+- Chỉ mô tả những gì bạn NHÌN THẤY: màu sắc men, họa tiết trang trí, kỹ thuật tạo hình, độ dày thành, loại xương gốm, vết nung, màu đế.
+- Nếu ảnh KHÔNG phải đồ gốm: chỉ trả về đúng một dòng JSON: {"is_pottery": false}
+- Nếu là gốm: trả về văn xuôi mô tả chi tiết (3–5 câu, không dùng markdown, không dùng dấu gạch đầu dòng). Cuối cùng mới trả về: {"is_pottery": true}
+
+Trả lời bằng tiếng Việt có đầy đủ dấu.\
+"""
+
+PROMPT_AGENT2_HISTORIAN = """\
+Bạn là sử gia chuyên về gốm sứ cổ Việt Nam.
+
+Bạn vừa nhận được bản mô tả vật lý của một hiện vật gốm từ chuyên gia quan sát:
+
+--- MÔ TẢ ---
+{observation}
+---
+
+Nhiệm vụ: Dựa HOÀN TOÀN vào bản mô tả trên, hãy đưa ra ĐÚNG HAI giả thuyết về làng gốm và niên đại.
+
+Mỗi giả thuyết phải:
+1. Đặt tên: "Giả thuyết A" hoặc "Giả thuyết B"
+2. Nêu tên làng gốm trong danh sách: Bat Trang, Bau Truc, Bien Hoa, Chu Dau, Dong Trieu, Lai Thieu, Phu Lang, Thanh Ha, Tho Ha
+3. Nêu lý do dựa trên đặc điểm vật lý đã mô tả
+4. Ước tính niên đại (thế kỷ)
+
+Kết thúc bằng một dòng JSON:
+{{"hypothesis_a": "<tên làng A>", "hypothesis_b": "<tên làng B>", "preferred": "<A hoặc B>"}}
+
+Không dùng markdown. Trả lời bằng tiếng Việt có đầy đủ dấu.\
+"""
+
+PROMPT_AGENT3_SKEPTIC = """\
+Bạn là nhà nghiên cứu hoài nghi, chuyên tìm điểm yếu trong luận điểm của các sử gia.
+
+Bản mô tả vật lý gốm:
+--- MÔ TẢ ---
+{observation}
+---
+
+Hai giả thuyết của sử gia:
+--- GIẢ THUYẾT ---
+{hypotheses}
+---
+
+Nhiệm vụ: Hãy phân tích nghiêm khắc:
+1. Chỉ ra ÍT NHẤT 2 điểm yếu hoặc mâu thuẫn trong từng giả thuyết.
+2. Đề xuất liệu có nguy cơ đây là gốm GIẢ CỔ (forgery) không và tại sao.
+3. Sau khi phản biện, cho biết bạn nghiêng về giả thuyết nào hơn (A hay B) và tại sao.
+4. Đánh giá mức độ rủi ro làm giả: một trong ["rất thấp", "thấp", "trung bình", "cao", "rất cao"]
+
+Kết thúc bằng một dòng JSON:
+{{"leans_towards": "<tên làng>", "forgery_risk": "<mức độ rủi ro>"}}
+
+Không dùng markdown. Trả lời bằng tiếng Việt có đầy đủ dấu.\
+"""
+
+PROMPT_META_COUNCIL = """\
+Bạn là Hội đồng chuyên gia gốm sứ Việt Nam. Sau đây là biên bản tranh luận đầy đủ:
+
+=== AGENT 1 – QUAN SÁT VIÊN (Gemini 2.5 Flash) ===
+{agent1_output}
+
+=== AGENT 2 – SỬ GIA (GPT-4o mini) ===
+{agent2_output}
+
+=== AGENT 3 – NGƯỜI HOÀI NGHI (Grok 4 Latest) ===
+{agent3_output}
+
+Nhiệm vụ: Tổng hợp toàn bộ tranh luận và đưa ra PHÁN QUYẾT CUỐI CÙNG:
+1. Viết 2–3 câu tóm tắt bằng chứng và lý luận chính (văn xuôi, không markdown).
+2. Xác định ĐÚNG MỘT làng gốm từ danh sách: Bat Trang, Bau Truc, Bien Hoa, Chu Dau, Dong Trieu, Lai Thieu, Phu Lang, Thanh Ha, Tho Ha.
+3. Cuối cùng, trả về ĐÚNG MỘT dòng JSON:
+{{"predicted_label": "<tên làng>", "confidence": <0.0–1.0>, "forgery_risk": "<rất thấp|thấp|trung bình|cao|rất cao>"}}
+
+Không dùng markdown. Trả lời bằng tiếng Việt có đầy đủ dấu.\
+"""
+
+
 def _strip_markdown(text: str) -> str:
-    # Remove ### headings (keep heading text)
     text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
-    # Remove **bold** and __bold__
     text = re.sub(r'\*{2}(.+?)\*{2}', r'\1', text, flags=re.DOTALL)
     text = re.sub(r'_{2}(.+?)_{2}',   r'\1', text, flags=re.DOTALL)
-    # Remove *italic* and _italic_
-    text = re.sub(r'\*(.+?)\*', r'\1', text, flags=re.DOTALL)
-    text = re.sub(r'_(.+?)_',   r'\1', text, flags=re.DOTALL)
-    # Remove leading list markers: "- " or "* " or "1. "
+    text = re.sub(r'\*(.+?)\*',       r'\1', text, flags=re.DOTALL)
+    text = re.sub(r'_(.+?)_',         r'\1', text, flags=re.DOTALL)
     text = re.sub(r'^\s*[-*]\s+',     '', text, flags=re.MULTILINE)
     text = re.sub(r'^\s*\d+\.\s+',    '', text, flags=re.MULTILINE)
-    # Collapse 3+ blank lines → 2
     text = re.sub(r'\n{3,}', '\n\n', text)
     return text.strip()
 
-# Result extraction
+
+# Extracts the last JSON object from a model response, stripping code fences
+def _extract_json(text: str) -> dict:
+    text = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    matches = list(re.finditer(r'\{[^{}]*\}', text, re.DOTALL))
+    if matches:
+        try:
+            return json.loads(matches[-1].group())
+        except json.JSONDecodeError:
+            pass
+    return {}
+
+
+# Returns the prose section before the final JSON block in a model response
+def _text_before_json(text: str) -> str:
+    match = re.search(r'\{[^{}]*\}(?!.*\{)', text, re.DOTALL)
+    if match:
+        return _strip_markdown(text[:match.start()].strip())
+    return _strip_markdown(text)
+
+
 def _closest_label(raw: str) -> str:
     raw_lower = raw.lower()
     for label in VALID_LABELS:
@@ -111,145 +183,282 @@ def _closest_label(raw: str) -> str:
             return label
     return max(VALID_LABELS, key=lambda lbl: sum(c in raw_lower for c in lbl.lower()))
 
-def extract_result(text: str) -> dict:
-    text = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
 
-    match = re.search(r'\{[^{}]*"predicted_label"[^{}]*\}', text, re.DOTALL)
-    data: dict | None = None
-    raw_text = ""
 
-    if match:
-        raw_text = _strip_markdown(text[: match.start()].strip())
-        try:
-            data = json.loads(match.group())
-        except json.JSONDecodeError:
-            logger.warning("JSON parse error on: %s", match.group()[:80])
-
-    if data is None:
-        logger.warning("No valid JSON in response, raw: %s", text[:120])
-        raw_text = _strip_markdown(text)
-        not_pottery_hints = ("not_pottery", "không phải gốm", "khong phai gom", "not pottery")
-        if any(h in text.lower() for h in not_pottery_hints):
-            return {"predicted_label": "not_pottery", "confidence": 0.0, "raw_text": raw_text}
-        data = {"predicted_label": "Bat Trang", "confidence": 0.5}
-
-    raw_label = str(data.get("predicted_label", ""))
-
-    if raw_label == "not_pottery":
-        return {
-            "predicted_label": "not_pottery",
-            "confidence": 0.0,
-            "raw_text": raw_text or "Ảnh này không phải gốm Việt Nam.",
-        }
-
-    if raw_label not in VALID_LABELS:
-        corrected = _closest_label(raw_label)
-        logger.warning("Label '%s' not in list -> corrected to '%s'", raw_label, corrected)
-        data["predicted_label"] = corrected
-
-    try:
-        data["confidence"] = max(0.0, min(1.0, float(data.get("confidence", 0.5))))
-    except (TypeError, ValueError):
-        data["confidence"] = 0.5
-
-    data["raw_text"] = raw_text or data["predicted_label"]
-    return data
-
-# Gemini helper (Google AI)
-async def _call_gemini(model_key: str, image_bytes: bytes) -> dict:
+async def _agent1_observer(image_bytes: bytes) -> dict:
     if not GOOGLE_API_KEY:
-        raise HTTPException(status_code=500, detail="GOOGLE_API_KEY is not set in .env")
+        raise HTTPException(500, detail="GOOGLE_API_KEY chưa được thiết lập trong .env")
     if not _GENAI_AVAILABLE:
-        raise HTTPException(status_code=500, detail="google-genai SDK not installed. Run: pip install google-genai")
-
-    model_id = MODELS[model_key]["model_id"]
-    logger.info("[Gemini/%s] Calling %s ...", model_key, model_id)
-
+        raise HTTPException(500, detail="Thư viện google-genai chưa được cài đặt.")
+    logger.info("[Agent1] Calling %s", GEMINI_MODEL)
     try:
         client = google_genai.Client(api_key=GOOGLE_API_KEY)
-        response = await client.aio.models.generate_content(
-            model=model_id,
-            contents=[
-                genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                genai_types.Part.from_text(text=PROMPT_VISION),
-            ],
+        response = await asyncio.wait_for(
+            client.aio.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[
+                    genai_types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
+                    genai_types.Part.from_text(text=PROMPT_AGENT1_OBSERVER),
+                ],
+            ),
+            timeout=AGENT_TIMEOUT_SEC,
         )
         raw = response.text or ""
-        logger.info("[Gemini/%s] Response: %s", model_key, raw[:300])
-        return extract_result(raw)
+        logger.info("[Agent1] Response: %s", raw[:250])
+        data = _extract_json(raw)
+        if data.get("is_pottery") is False:
+            return {"is_pottery": False, "observation": ""}
+        observation = _text_before_json(raw)
+        return {"is_pottery": True, "observation": observation, "raw": raw}
+    except asyncio.TimeoutError:
+        raise HTTPException(504, detail="Agent 1 (Quan sát viên) hết thời gian chờ.")
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error("[Gemini/%s] Error: %s", model_key, exc)
-        raise HTTPException(status_code=502, detail=f"Gemini error ({model_id}): {exc}")
+        logger.error("[Agent1] Error: %s", exc)
+        raise HTTPException(502, detail=f"Lỗi Agent 1 (Gemini Vision): {exc}")
 
-# Groq helper
-async def _call_groq(model_key: str, image_bytes: bytes) -> dict:
-    if not GROQ_API_KEY:
-        raise HTTPException(status_code=500, detail="GROQ_API_KEY is not set in .env")
 
-    model_id = MODELS[model_key]["model_id"]
-    logger.info("[Groq/%s] Calling %s ...", model_key, model_id)
 
-    client = openai.OpenAI(api_key=GROQ_API_KEY, base_url="https://api.groq.com/openai/v1")
-    b64 = base64.b64encode(image_bytes).decode()
-
-    def _vision_messages() -> list:
-        return [{"role": "user", "content": [
-            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
-            {"type": "text", "text": PROMPT_VISION},
-        ]}]
-
+async def _agent2_historian(observation: str) -> dict:
+    if not OPENAI_API_KEY:
+        raise HTTPException(500, detail="OPENAI_API_KEY chưa được thiết lập trong .env")
+    logger.info("[Agent2] Calling %s", OPENAI_MODEL)
+    prompt = PROMPT_AGENT2_HISTORIAN.format(observation=observation)
     try:
-        resp = client.chat.completions.create(
-            model=model_id, messages=_vision_messages(), max_tokens=512
+        client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE)
+        resp = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=800,
+                temperature=0.4,
+            ),
+            timeout=AGENT_TIMEOUT_SEC,
         )
         raw = resp.choices[0].message.content or ""
-        logger.info("[Groq/%s] Response: %s", model_key, raw[:300])
-        return extract_result(raw)
+        logger.info("[Agent2] Response: %s", raw[:250])
+        data = _extract_json(raw)
+        hypotheses_text = _text_before_json(raw)
+        return {
+            "hypotheses_text": hypotheses_text,
+            "hypothesis_a":    data.get("hypothesis_a", ""),
+            "hypothesis_b":    data.get("hypothesis_b", ""),
+            "preferred":       data.get("preferred", "A"),
+            "raw":             raw,
+        }
+    except asyncio.TimeoutError:
+        raise HTTPException(504, detail="Agent 2 (Sử gia) hết thời gian chờ.")
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error("[Groq/%s] Error: %s", model_key, exc)
-        raise HTTPException(status_code=502, detail=f"Groq error: {exc}")
+        logger.error("[Agent2] Error: %s", exc)
+        raise HTTPException(502, detail=f"Lỗi Agent 2 (OpenAI GPT-4o mini): {exc}")
 
 
-# -- Endpoint -----------------------------------------------------------------
-@app.post("/predict")
-async def predict(
-    file: UploadFile = File(...),
-    model: str = Query(
-        default=DEFAULT_MODEL,
-        description="Model key: gemini | gemini3 | gemini_lite | llama4",
-    ),
-):
-    image_bytes = await file.read()
+
+async def _agent3_skeptic(observation: str, hypotheses_text: str) -> dict:
+    if not XAI_API_KEY:
+        raise HTTPException(500, detail="XAI_API_KEY chưa được thiết lập trong .env")
+    logger.info("[Agent3] Calling %s", GROK_MODEL)
+    prompt = PROMPT_AGENT3_SKEPTIC.format(
+        observation=observation, hypotheses=hypotheses_text
+    )
+    try:
+        client = openai.AsyncOpenAI(api_key=XAI_API_KEY, base_url=XAI_BASE)
+        resp = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=GROK_MODEL,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Bạn là nhà nghiên cứu hoài nghi, sắc bén và thẳng thắn. "
+                            "Trả lời bằng tiếng Việt có đầy đủ dấu."
+                        ),
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=800,
+                temperature=0.5,
+            ),
+            timeout=AGENT_TIMEOUT_SEC,
+        )
+        raw = resp.choices[0].message.content or ""
+        logger.info("[Agent3] Response: %s", raw[:250])
+        data = _extract_json(raw)
+        skeptic_text = _text_before_json(raw)
+        return {
+            "skeptic_text":  skeptic_text,
+            "leans_towards": data.get("leans_towards", ""),
+            "forgery_risk":  data.get("forgery_risk", "thấp"),
+            "raw":           raw,
+        }
+    except asyncio.TimeoutError:
+        raise HTTPException(504, detail="Agent 3 (Người hoài nghi) hết thời gian chờ.")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("[Agent3] Error: %s", exc)
+        raise HTTPException(502, detail=f"Lỗi Agent 3 (Grok 4 Latest – xAI): {exc}")
+
+
+
+async def _meta_council(
+    agent1_output: str,
+    agent2_output: str,
+    agent3_output: str,
+) -> dict:
+    if not GOOGLE_API_KEY:
+        raise HTTPException(500, detail="GOOGLE_API_KEY chưa được thiết lập trong .env")
+    if not _GENAI_AVAILABLE:
+        raise HTTPException(500, detail="Thư viện google-genai chưa được cài đặt.")
+    logger.info("[Meta] Calling %s", GEMINI_MODEL)
+    prompt = PROMPT_META_COUNCIL.format(
+        agent1_output=agent1_output,
+        agent2_output=agent2_output,
+        agent3_output=agent3_output,
+    )
+    try:
+        client = google_genai.Client(api_key=GOOGLE_API_KEY)
+        response = await asyncio.wait_for(
+            client.aio.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=[genai_types.Part.from_text(text=prompt)],
+            ),
+            timeout=AGENT_TIMEOUT_SEC,
+        )
+        raw = response.text or ""
+        logger.info("[Meta] Verdict: %s", raw[:300])
+        data      = _extract_json(raw)
+        rationale = _text_before_json(raw)
+
+        raw_label = str(data.get("predicted_label", ""))
+        if raw_label not in VALID_LABELS:
+            raw_label = _closest_label(raw_label)
+
+        try:
+            confidence = max(0.0, min(1.0, float(data.get("confidence", 0.5))))
+        except (TypeError, ValueError):
+            confidence = 0.5
+
+        return {
+            "predicted_label": raw_label,
+            "confidence":      confidence,
+            "rationale":       rationale,
+            "forgery_risk":    data.get("forgery_risk", "thấp"),
+        }
+    except asyncio.TimeoutError:
+        raise HTTPException(504, detail="Meta-Agent (Hội đồng) hết thời gian chờ.")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error("[Meta] Error: %s", exc)
+        raise HTTPException(502, detail=f"Lỗi Meta-Agent (Gemini): {exc}")
+
+
+
+# Runs the four agents sequentially; each agent receives the prior agent's output
+async def _run_tadp_pipeline(image_bytes: bytes) -> dict:
+    debate_trail: list[dict] = []
+
+    a1 = await _agent1_observer(image_bytes)
+
+    # Short-circuit: non-pottery images skip the remaining three agents
+    if not a1.get("is_pottery", True):
+        return {
+            "predicted_label": "not_pottery",
+            "confidence":      0.0,
+            "raw_text":        "Ảnh này không phải gốm Việt Nam.",
+            "evidence":        "",
+            "rationale":       "",
+            "forgery_risk":    "không áp dụng",
+            "debate_trail": [{
+                "step":    1,
+                "agent":   "Quan sát viên",
+                "model":   GEMINI_MODEL,
+                "role":    "Phân tích hình ảnh",
+                "content": "Ảnh không chứa đồ gốm. Pipeline dừng tại đây.",
+            }],
+        }
+
+    observation = a1["observation"]
+    debate_trail.append({
+        "step": 1, "agent": "Quan sát viên",
+        "model": GEMINI_MODEL, "role": "Mô tả vật lý",
+        "content": observation,
+    })
+    logger.info("[TADP] Step 1 done, observation: %d chars", len(observation))
+
+    a2 = await _agent2_historian(observation)
+    debate_trail.append({
+        "step": 2, "agent": "Sử gia",
+        "model": OPENAI_MODEL, "role": "Phân tích lịch sử & Giả thuyết",
+        "content": a2["hypotheses_text"],
+    })
+    logger.info("[TADP] Step 2 done, A=%s B=%s", a2["hypothesis_a"], a2["hypothesis_b"])
+
+    a3 = await _agent3_skeptic(observation, a2["hypotheses_text"])
+    debate_trail.append({
+        "step": 3, "agent": "Người hoài nghi",
+        "model": GROK_MODEL, "role": "Phản biện & Đánh giá rủi ro",
+        "content": a3["skeptic_text"],
+    })
+    logger.info("[TADP] Step 3 done, leans=%s forgery=%s", a3["leans_towards"], a3["forgery_risk"])
+
+    meta = await _meta_council(
+        agent1_output=a1["raw"],
+        agent2_output=a2["raw"],
+        agent3_output=a3["raw"],
+    )
+    debate_trail.append({
+        "step": 4, "agent": "Hội đồng",
+        "model": GEMINI_MODEL, "role": "Phán quyết cuối cùng",
+        "content": meta["rationale"],
+    })
     logger.info(
-        "POST /predict  model=%s  file=%s  size=%d bytes",
-        model, file.filename, len(image_bytes),
+        "[TADP] Step 4 done, label=%s confidence=%.1f%% forgery=%s",
+        meta["predicted_label"], meta["confidence"] * 100, meta["forgery_risk"],
     )
 
+    return {
+        "predicted_label": meta["predicted_label"],
+        "confidence":      meta["confidence"],
+        "raw_text":        meta["rationale"],
+        "evidence":        observation,
+        "rationale":       a2["hypotheses_text"],
+        "forgery_risk":    meta["forgery_risk"],
+        "debate_trail":    debate_trail,
+    }
+
+
+
+@app.post("/predict")
+async def predict(file: UploadFile = File(...)):
+    image_bytes = await file.read()
+    logger.info(
+        "POST /predict  pipeline=TADP  file=%s  size=%d bytes",
+        file.filename, len(image_bytes),
+    )
     safe_name = Path(file.filename).name if file.filename else "upload.jpg"
     with open(os.path.join(UPLOAD_FOLDER, safe_name), "wb") as f:
         f.write(image_bytes)
 
-    model_key = model.lower().strip()
-    if model_key not in MODELS:
-        logger.warning("Unknown model key '%s', falling back to '%s'", model, DEFAULT_MODEL)
-        model_key = DEFAULT_MODEL
-
-    provider = MODELS[model_key]["provider"]
-
     try:
-        if provider == "google":
-            result = await _call_gemini(model_key, image_bytes)
-        else:
-            result = await _call_groq(model_key, image_bytes)
+        result = await asyncio.wait_for(
+            _run_tadp_pipeline(image_bytes),
+            timeout=TOTAL_TIMEOUT_SEC,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(504, detail="Pipeline TADP hết thời gian chờ tổng thể (210 giây).")
     except HTTPException:
         raise
     except Exception as exc:
-        logger.exception("Unexpected prediction error:")
-        raise HTTPException(status_code=502, detail=f"AI model error: {exc}")
+        logger.exception("Lỗi không xác định trong TADP pipeline:")
+        raise HTTPException(502, detail=f"Lỗi hệ thống AI: {exc}")
 
-    logger.info("Result: %s", result)
+    logger.info(
+        "Final result: label=%s  confidence=%.2f  forgery=%s",
+        result["predicted_label"], result["confidence"], result.get("forgery_risk"),
+    )
     return result

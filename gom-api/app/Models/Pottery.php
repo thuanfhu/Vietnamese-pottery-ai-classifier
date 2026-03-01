@@ -12,5 +12,14 @@ class Pottery extends Model
         'confidence',
         'ai_model',
         'raw_answer',
+        'evidence',
+        'rationale',
+        'forgery_risk',
+        'debate_trail',
+    ];
+
+    protected $casts = [
+        'confidence'   => 'float',
+        'debate_trail' => 'array',
     ];
 }

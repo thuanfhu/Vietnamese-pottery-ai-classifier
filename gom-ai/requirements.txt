@@ -3,5 +3,5 @@ uvicorn[standard]
 Pillow
 python-multipart
 python-dotenv
-openai
+openai>=1.30.0
 google-genai

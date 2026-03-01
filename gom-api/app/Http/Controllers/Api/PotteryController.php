@@ -20,20 +20,18 @@ class PotteryController extends Controller
     {
         $request->validate([
             'image' => 'required|image',
-            'model' => 'nullable|string|in:gemini,gemini3,gemini_lite,llama4',
         ]);
 
         $path = $request->file('image')->store('potteries', 'public');
 
         $fullPath = storage_path('app/public/' . $path);
 
-        $model = $request->input('model', 'gemini');
-
-        $response = Http::timeout(60)->attach(
+        // Send the image to the Python AI server and await the TADP pipeline result
+        $response = Http::timeout(220)->attach(
             'file',
             file_get_contents($fullPath),
             basename($fullPath)
-        )->post('http://127.0.0.1:8001/predict?model=' . urlencode($model));
+        )->post('http://127.0.0.1:8001/predict');
 
         if (!$response->successful()) {
             Storage::disk('public')->delete($path);
@@ -51,8 +49,10 @@ class PotteryController extends Controller
                 'data'    => [
                     'predicted_label' => 'not_pottery',
                     'confidence'      => 0,
-                    'ai_model'        => $model,
+                    'ai_model'        => 'TADP',
                     'raw_answer'      => $result['raw_text'] ?? null,
+                    'forgery_risk'    => $result['forgery_risk'] ?? null,
+                    'debate_trail'    => $result['debate_trail'] ?? [],
                 ]
             ]);
         }
@@ -61,8 +61,12 @@ class PotteryController extends Controller
             'image_path'      => $path,
             'predicted_label' => $result['predicted_label'] ?? null,
             'confidence'      => $result['confidence'] ?? null,
-            'ai_model'        => $model,
+            'ai_model'        => 'TADP',
             'raw_answer'      => $result['raw_text'] ?? null,
+            'evidence'        => $result['evidence'] ?? null,
+            'rationale'       => $result['rationale'] ?? null,
+            'forgery_risk'    => $result['forgery_risk'] ?? null,
+            'debate_trail'    => $result['debate_trail'] ?? [],
         ]);
 
         return response()->json([
